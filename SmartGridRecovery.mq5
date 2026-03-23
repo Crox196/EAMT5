@@ -383,6 +383,18 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
    if(lastProfit <= 0 || firstProfit >= 0)
       return;
 
+   // LAST must have moved at least half the grid spacing in profit
+   // This prevents micro-bounce recovery on tiny movements
+   double lastPriceDiff = 0;
+   if(direction == ORDER_TYPE_BUY)
+      lastPriceDiff = SymbolInfoDouble(_Symbol, SYMBOL_BID) - openPrices[lastIdx];
+   else
+      lastPriceDiff = openPrices[lastIdx] - SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   double minRecoveryDistance = gridSpacingPoints * 0.5;
+   if(lastPriceDiff < minRecoveryDistance)
+      return;
+
    // Check: can LAST's profit cover FIRST's loss + surplus?
    double absLoss = MathAbs(firstProfit);
    double surplusMultiplier = 1.0 + (InpSurplusPercent / 100.0);
@@ -398,10 +410,12 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
 
       lastRecoveryTime = TimeCurrent();
 
+      double pipMult = (symDigits == 3 || symDigits == 5) ? 10.0 : 1.0;
       Print("RECOVERY: LAST #", tickets[lastIdx], " (+", DoubleToString(lastProfit, 2), ")",
             " closed FIRST #", tickets[firstIdx], " (", DoubleToString(firstProfit, 2), ")",
             " | Net surplus: +", DoubleToString(surplus, 2),
-            " | Remaining positions: ", count - 2);
+            " | LAST moved: ", DoubleToString(lastPriceDiff / (pointValue * pipMult), 1), " pips",
+            " | Remaining: ", count - 2);
    }
 }
 
