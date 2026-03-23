@@ -23,7 +23,6 @@ input double   InpLotMultiplier    = 1.3;     // Lot multiplier per grid level
 
 input group "=== Recovery Settings ==="
 input double   InpSurplusPercent   = 10.0;    // Surplus % on each recovery closure (e.g. 10 = 10% extra)
-input bool     InpPartialRecovery  = true;    // Close losers one-by-one (true) or all at once (false)
 
 input group "=== Direction & Filter ==="
 input ENUM_ORDER_TYPE InpInitialDirection = ORDER_TYPE_BUY; // Initial direction
@@ -277,11 +276,12 @@ void ManageGridSide(ENUM_ORDER_TYPE direction, int currentCount)
 }
 
 //+------------------------------------------------------------------+
-//| Recovery: use last profitable trade to close losers               |
+//| Recovery: LAST position covers FIRST position's loss + surplus    |
+//| Close both, then repeat with next pair until done.                |
 //+------------------------------------------------------------------+
 void RecoveryCheck(ENUM_ORDER_TYPE direction)
 {
-   // Collect all positions for this direction
+   // Collect all positions for this direction, sorted by open time
    int count = 0;
    ulong tickets[];
    double profits[];
@@ -324,201 +324,80 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
       openTimes[idx]  = posInfo.Time();
    }
 
-   if(count == 0)
+   if(count < 2)
       return;
 
-   // === CASE 1: Single orphan position - give it a TP if it doesn't have one ===
-   if(count == 1)
-   {
-      if(profits[0] > 0 && InpTakeProfitPips > 0)
-      {
-         // Check if it already has a TP
-         if(PositionSelectByTicket(tickets[0]))
-         {
-            double currentTP = PositionGetDouble(POSITION_TP);
-            if(currentTP == 0)
-            {
-               // Orphan with no TP - add TP so it can close itself
-               double sl = PositionGetDouble(POSITION_SL);
-               double tpDistance = InpTakeProfitPips * PointsToPips();
-               double tp = 0;
-               if(direction == ORDER_TYPE_BUY)
-                  tp = NormalizeDouble(openPrices[0] + tpDistance, symDigits);
-               else
-                  tp = NormalizeDouble(openPrices[0] - tpDistance, symDigits);
+   // Sort by open time: index 0 = FIRST (oldest), index count-1 = LAST (newest)
+   SortByOpenTime(tickets, profits, openPrices, lots, openTimes, count);
 
-               trade.PositionModify(tickets[0], sl, tp);
-               Print("ORPHAN: Added TP ", DoubleToString(tp, symDigits),
-                     " to position #", tickets[0]);
-            }
-         }
-      }
+   // === CORE LOGIC: LAST covers FIRST ===
+   int firstIdx = 0;            // Oldest position (in loss)
+   int lastIdx  = count - 1;    // Newest position (recovery trade, in profit)
+
+   double firstProfit = profits[firstIdx];   // Should be negative (loss)
+   double lastProfit  = profits[lastIdx];    // Should be positive (gain)
+
+   // Last must be in profit
+   if(lastProfit <= 0)
       return;
-   }
 
-   // === CASE 2: Multiple positions - find ALL winners and ALL losers ===
-   int winnerIndices[];
-   double winnerProfits[];
-   int winnerCount = 0;
-
-   int loserIndices[];
-   double loserProfits[];
-   int loserCount = 0;
-
-   for(int i = 0; i < count; i++)
+   // First must be in loss
+   if(firstProfit >= 0)
    {
-      if(profits[i] > 0)
-      {
-         ArrayResize(winnerIndices, winnerCount + 1);
-         ArrayResize(winnerProfits, winnerCount + 1);
-         winnerIndices[winnerCount] = i;
-         winnerProfits[winnerCount] = profits[i];
-         winnerCount++;
-      }
-      else if(profits[i] < 0)
-      {
-         ArrayResize(loserIndices, loserCount + 1);
-         ArrayResize(loserProfits, loserCount + 1);
-         loserIndices[loserCount] = i;
-         loserProfits[loserCount] = profits[i];
-         loserCount++;
-      }
-   }
-
-   // No losers: check if total profit justifies closing all
-   if(loserCount == 0)
-   {
+      // All positions profitable - close everything
       double totalProfit = 0;
       for(int i = 0; i < count; i++)
          totalProfit += profits[i];
-
-      // Close all if combined profit > surplus threshold
-      double minClose = InpSurplusPercent * InpBaseLotSize *
-                        SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      if(totalProfit > minClose)
+      if(totalProfit > 0)
       {
          CloseAllPositions(direction);
-         Print("ALL IN PROFIT: Closed all ", count, " positions. Total: +",
+         Print("ALL IN PROFIT: Closed ", count, " positions. Total: +",
                DoubleToString(totalProfit, 2));
       }
       return;
    }
 
-   // No winners yet: nothing to recover with
-   if(winnerCount == 0)
-      return;
-
-   // === RECOVERY: Pool ALL winning profit together ===
-   double totalWinProfit = 0;
-   for(int i = 0; i < winnerCount; i++)
-      totalWinProfit += winnerProfits[i];
-
-   // Sort losers by smallest loss first
-   SortLosersByLoss(loserIndices, loserProfits, loserCount);
-
+   // Check: can LAST's profit cover FIRST's loss + surplus?
+   double absLoss = MathAbs(firstProfit);
    double surplusMultiplier = 1.0 + (InpSurplusPercent / 100.0);
+   double requiredProfit = absLoss * surplusMultiplier;
 
-   if(InpPartialRecovery)
+   if(lastProfit >= requiredProfit)
    {
-      // Progressive: use combined winner profit to close losers one by one
-      double availableProfit = totalWinProfit;
-      int closedLosers = 0;
-      double totalSurplusEarned = 0;
+      double surplus = lastProfit - absLoss;
 
-      for(int i = 0; i < loserCount; i++)
-      {
-         double absLoss = MathAbs(loserProfits[i]);
-         double requiredProfit = absLoss * surplusMultiplier;
+      // Close FIRST (loser) and LAST (winner) together
+      trade.PositionClose(tickets[firstIdx]);
+      trade.PositionClose(tickets[lastIdx]);
 
-         if(availableProfit >= requiredProfit)
-         {
-            int idx = loserIndices[i];
-            double surplus = requiredProfit - absLoss;
+      Print("RECOVERY: LAST #", tickets[lastIdx], " (+" , DoubleToString(lastProfit, 2), ")",
+            " closed FIRST #", tickets[firstIdx], " (", DoubleToString(firstProfit, 2), ")",
+            " | Net surplus: +", DoubleToString(surplus, 2),
+            " | Remaining positions: ", count - 2);
 
-            trade.PositionClose(tickets[idx]);
-            closedLosers++;
-            totalSurplusEarned += surplus;
-            availableProfit -= requiredProfit;
-
-            Print("RECOVERY: Closed loser #", tickets[idx],
-                  " | Loss: ", DoubleToString(loserProfits[i], 2),
-                  " | Surplus: +", DoubleToString(surplus, 2),
-                  " | Pool remaining: ", DoubleToString(availableProfit, 2));
-         }
-         else
-         {
-            break;
-         }
-      }
-
-      // If ALL losers closed, close ALL winners too to lock profit
-      if(closedLosers > 0 && closedLosers == loserCount)
-      {
-         for(int i = 0; i < winnerCount; i++)
-            trade.PositionClose(tickets[winnerIndices[i]]);
-
-         Print("RECOVERY COMPLETE: ", closedLosers, " losers + ", winnerCount, " winners closed.",
-               " Surplus: +", DoubleToString(totalSurplusEarned, 2),
-               " Locked: +", DoubleToString(availableProfit, 2));
-      }
-      // Closed some losers but not all: close winners to lock partial recovery
-      else if(closedLosers > 0)
-      {
-         // Check if remaining profit is too small to cover next loser
-         int nextLoserArrayIdx = closedLosers; // index in loserIndices
-         double nextLossNeeded = MathAbs(loserProfits[nextLoserArrayIdx]) * surplusMultiplier;
-
-         if(availableProfit < nextLossNeeded * 0.3)
-         {
-            // Not enough to cover next loser: close all winners, lock gains
-            for(int i = 0; i < winnerCount; i++)
-               trade.PositionClose(tickets[winnerIndices[i]]);
-
-            Print("RECOVERY PARTIAL: ", closedLosers, "/", loserCount, " losers closed.",
-                  " Surplus: +", DoubleToString(totalSurplusEarned, 2),
-                  " Winners closed to lock profit.");
-         }
-         // Otherwise keep winners open to grow more profit
-      }
-   }
-   else
-   {
-      // Batch: close ALL only when total winner profit covers ALL losses + surplus
-      double totalRequired = 0;
-      for(int i = 0; i < loserCount; i++)
-         totalRequired += MathAbs(loserProfits[i]) * surplusMultiplier;
-
-      if(totalWinProfit >= totalRequired)
-      {
-         CloseAllPositions(direction);
-         Print("RECOVERY BATCH: All closed. Winners: +", DoubleToString(totalWinProfit, 2),
-               " | Required: ", DoubleToString(totalRequired, 2),
-               " | Net surplus: +", DoubleToString(totalWinProfit - totalRequired, 2));
-      }
+      // After closing this pair, the next tick will check the new first/last pair
    }
 }
 
 //+------------------------------------------------------------------+
-//| Sort losers by smallest loss first                                |
+//| Sort all position arrays by open time ascending (oldest first)    |
 //+------------------------------------------------------------------+
-void SortLosersByLoss(int &indices[], double &profitsArr[], int size)
+void SortByOpenTime(ulong &tix[], double &prof[], double &prices[],
+                    double &lt[], datetime &times[], int size)
 {
-   // Simple bubble sort (small arrays)
+   // Bubble sort by openTimes ascending
    for(int i = 0; i < size - 1; i++)
    {
       for(int j = 0; j < size - i - 1; j++)
       {
-         // Sort by absolute loss ascending (smallest loss first)
-         if(MathAbs(profitsArr[j]) > MathAbs(profitsArr[j + 1]))
+         if(times[j] > times[j + 1])
          {
-            // Swap
-            double tmpProfit = profitsArr[j];
-            profitsArr[j] = profitsArr[j + 1];
-            profitsArr[j + 1] = tmpProfit;
-
-            int tmpIdx = indices[j];
-            indices[j] = indices[j + 1];
-            indices[j + 1] = tmpIdx;
+            // Swap all arrays
+            ulong    tmpT = tix[j];     tix[j] = tix[j+1];       tix[j+1] = tmpT;
+            double   tmpP = prof[j];    prof[j] = prof[j+1];     prof[j+1] = tmpP;
+            double   tmpR = prices[j];  prices[j] = prices[j+1]; prices[j+1] = tmpR;
+            double   tmpL = lt[j];      lt[j] = lt[j+1];         lt[j+1] = tmpL;
+            datetime tmpD = times[j];   times[j] = times[j+1];   times[j+1] = tmpD;
          }
       }
    }
