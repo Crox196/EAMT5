@@ -45,7 +45,7 @@ CPositionInfo  posInfo;
 
 double         gridSpacingPoints;    // Grid spacing in points (fixed at grid start)
 double         pointValue;           // Point value
-int            digits;               // Symbol digits
+int            symDigits;               // Symbol symDigits
 int            atrHandle;            // ATR indicator handle
 int            emaHandle;            // EMA indicator handle
 datetime       lastBarTime;          // Track new bar
@@ -73,10 +73,18 @@ int OnInit()
    // Setup trade object
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(10);
-   trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+   // Auto-detect filling mode
+   long fillType = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fillType & SYMBOL_FILLING_FOK) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((fillType & SYMBOL_FILLING_IOC) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
    // Symbol info
-   digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   symDigits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
    // Create ATR handle (Daily timeframe for average daily range)
@@ -179,7 +187,7 @@ void UpdateGridSpacing()
    gridSpacingPoints = dailyATR / divisor;
 
    // Minimum spacing: 10 pips for 5-digit brokers
-   double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+   double pipMultiplier = (symDigits == 3 || symDigits == 5) ? 10.0 : 1.0;
    double minSpacing = 10.0 * pointValue * pipMultiplier;
    if(gridSpacingPoints < minSpacing)
       gridSpacingPoints = minSpacing;
@@ -249,7 +257,7 @@ void ManageGridSide(ENUM_ORDER_TYPE direction, int currentCount)
       lot = NormalizeLot(lot);
 
       string levelComment = "L" + IntegerToString(currentCount + 1);
-      double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+      double pipMultiplier = (symDigits == 3 || symDigits == 5) ? 10.0 : 1.0;
 
       if(OpenPosition(direction, lot, levelComment))
       {
@@ -556,17 +564,21 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, double lot, string levelTag)
 
    string comment = InpComment + "_" + levelTag;
 
-   // TP only on the initial position (L1) - grid levels use recovery system
+   // Calculate TP for initial position (L1)
    double tp = 0;
    if(levelTag == "L1" && InpTakeProfitPips > 0)
    {
       double tpDistance = InpTakeProfitPips * PointsToPips();
       if(direction == ORDER_TYPE_BUY)
-         tp = NormalizeDouble(ask + tpDistance, digits);
+         tp = NormalizeDouble(ask + tpDistance, symDigits);
       else
-         tp = NormalizeDouble(bid - tpDistance, digits);
+         tp = NormalizeDouble(bid - tpDistance, symDigits);
+
+      Print("TP calculated: price=", (direction == ORDER_TYPE_BUY ? DoubleToString(ask, symDigits) : DoubleToString(bid, symDigits)),
+            " + ", DoubleToString(tpDistance, symDigits), " = ", DoubleToString(tp, symDigits));
    }
 
+   // Open position with TP
    bool result = false;
    if(direction == ORDER_TYPE_BUY)
       result = trade.Buy(lot, _Symbol, ask, 0, tp, comment);
@@ -577,11 +589,30 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, double lot, string levelTag)
    {
       Print("Position opened: ", (direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
             " Lot: ", DoubleToString(lot, 2), " Level: ", levelTag,
-            (tp > 0 ? " TP: " + DoubleToString(tp, digits) : ""));
+            (tp > 0 ? " TP: " + DoubleToString(tp, symDigits) : " NO TP"));
+
+      // If TP was requested but position opened without it, modify to add TP
+      if(tp > 0)
+      {
+         ulong ticket = trade.ResultOrder();
+         if(ticket > 0 && PositionSelectByTicket(ticket))
+         {
+            double currentTP = PositionGetDouble(POSITION_TP);
+            if(currentTP == 0)
+            {
+               double sl = PositionGetDouble(POSITION_SL);
+               if(trade.PositionModify(ticket, sl, tp))
+                  Print("TP added via modify: ", DoubleToString(tp, symDigits));
+               else
+                  Print("WARNING: Failed to set TP. Error: ", GetLastError());
+            }
+         }
+      }
    }
    else
    {
-      Print("Failed to open position. Error: ", GetLastError());
+      Print("Failed to open position. Error: ", GetLastError(),
+            " RetCode: ", trade.ResultRetcode());
    }
 
    return result;
@@ -703,7 +734,7 @@ double NormalizeLot(double lot)
 //+------------------------------------------------------------------+
 double PointsToPips()
 {
-   if(digits == 3 || digits == 5)
+   if(symDigits == 3 || symDigits == 5)
       return pointValue * 10;
    return pointValue;
 }
