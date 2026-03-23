@@ -23,6 +23,7 @@ input double   InpLotMultiplier    = 1.3;     // Lot multiplier per grid level
 
 input group "=== Recovery Settings ==="
 input double   InpSurplusPercent   = 10.0;    // Surplus % on each recovery closure (e.g. 10 = 10% extra)
+input double   InpMinProfitToClose = 50.0;    // Min total profit USD to close positions
 
 input group "=== Direction & Filter ==="
 input ENUM_ORDER_TYPE InpInitialDirection = ORDER_TYPE_BUY; // Initial direction
@@ -333,24 +334,7 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
    if(count == 0)
       return;
 
-   // Calculate TP threshold in money (for closing logic)
-   double tpMoney = InpTakeProfitPips * PointsToPips() * InpBaseLotSize *
-                    SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-
-   // === SINGLE POSITION: close only when it reaches TP target ===
-   if(count == 1)
-   {
-      if(profits[0] >= tpMoney && tpMoney > 0)
-      {
-         trade.PositionClose(tickets[0]);
-         lastRecoveryTime = TimeCurrent();
-         Print("SINGLE POSITION #", tickets[0], " hit TP target, closed: +",
-               DoubleToString(profits[0], 2));
-      }
-      return;
-   }
-
-   // === CHECK: are ALL positions in profit with meaningful total? ===
+   // === Calculate total profit across all positions ===
    double totalProfit = 0;
    bool allPositive = true;
    for(int i = 0; i < count; i++)
@@ -360,7 +344,22 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
          allPositive = false;
    }
 
-   if(allPositive && totalProfit >= tpMoney)
+   // === MASTER FILTER: total profit must be >= minimum before ANY close ===
+   if(totalProfit < InpMinProfitToClose)
+      return;
+
+   // === SINGLE POSITION: close if total profit >= minimum ===
+   if(count == 1)
+   {
+      trade.PositionClose(tickets[0]);
+      lastRecoveryTime = TimeCurrent();
+      Print("SINGLE POSITION #", tickets[0], " closed: +",
+            DoubleToString(profits[0], 2));
+      return;
+   }
+
+   // === ALL IN PROFIT: close everything ===
+   if(allPositive)
    {
       CloseAllPositions(direction);
       lastRecoveryTime = TimeCurrent();
@@ -383,18 +382,6 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
    if(lastProfit <= 0 || firstProfit >= 0)
       return;
 
-   // LAST must have moved at least half the grid spacing in profit
-   // This prevents micro-bounce recovery on tiny movements
-   double lastPriceDiff = 0;
-   if(direction == ORDER_TYPE_BUY)
-      lastPriceDiff = SymbolInfoDouble(_Symbol, SYMBOL_BID) - openPrices[lastIdx];
-   else
-      lastPriceDiff = openPrices[lastIdx] - SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   double minRecoveryDistance = gridSpacingPoints * 0.5;
-   if(lastPriceDiff < minRecoveryDistance)
-      return;
-
    // Check: can LAST's profit cover FIRST's loss + surplus?
    double absLoss = MathAbs(firstProfit);
    double surplusMultiplier = 1.0 + (InpSurplusPercent / 100.0);
@@ -410,11 +397,10 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
 
       lastRecoveryTime = TimeCurrent();
 
-      double pipMult = (symDigits == 3 || symDigits == 5) ? 10.0 : 1.0;
       Print("RECOVERY: LAST #", tickets[lastIdx], " (+", DoubleToString(lastProfit, 2), ")",
             " closed FIRST #", tickets[firstIdx], " (", DoubleToString(firstProfit, 2), ")",
             " | Net surplus: +", DoubleToString(surplus, 2),
-            " | LAST moved: ", DoubleToString(lastPriceDiff / (pointValue * pipMult), 1), " pips",
+            " | Total profit: +", DoubleToString(totalProfit, 2),
             " | Remaining: ", count - 2);
    }
 }
