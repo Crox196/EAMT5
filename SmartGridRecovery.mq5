@@ -324,37 +324,58 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
       openTimes[idx]  = posInfo.Time();
    }
 
-   if(count < 2)
+   if(count == 0)
       return;
 
-   // Find the newest position (last grid level = recovery trade)
-   int newestIdx = 0;
-   datetime newestTime = 0;
-   for(int i = 0; i < count; i++)
+   // === CASE 1: Single orphan position - give it a TP if it doesn't have one ===
+   if(count == 1)
    {
-      if(openTimes[i] > newestTime)
+      if(profits[0] > 0 && InpTakeProfitPips > 0)
       {
-         newestTime = openTimes[i];
-         newestIdx = i;
+         // Check if it already has a TP
+         if(PositionSelectByTicket(tickets[0]))
+         {
+            double currentTP = PositionGetDouble(POSITION_TP);
+            if(currentTP == 0)
+            {
+               // Orphan with no TP - add TP so it can close itself
+               double sl = PositionGetDouble(POSITION_SL);
+               double tpDistance = InpTakeProfitPips * PointsToPips();
+               double tp = 0;
+               if(direction == ORDER_TYPE_BUY)
+                  tp = NormalizeDouble(openPrices[0] + tpDistance, symDigits);
+               else
+                  tp = NormalizeDouble(openPrices[0] - tpDistance, symDigits);
+
+               trade.PositionModify(tickets[0], sl, tp);
+               Print("ORPHAN: Added TP ", DoubleToString(tp, symDigits),
+                     " to position #", tickets[0]);
+            }
+         }
       }
+      return;
    }
 
-   double recoveryProfit = profits[newestIdx];
+   // === CASE 2: Multiple positions - find ALL winners and ALL losers ===
+   int winnerIndices[];
+   double winnerProfits[];
+   int winnerCount = 0;
 
-   // Recovery trade must be in profit
-   if(recoveryProfit <= 0)
-      return;
-
-   // Find losing positions sorted by smallest loss first (easiest to recover)
    int loserIndices[];
    double loserProfits[];
    int loserCount = 0;
 
    for(int i = 0; i < count; i++)
    {
-      if(i == newestIdx)
-         continue;
-      if(profits[i] < 0)
+      if(profits[i] > 0)
+      {
+         ArrayResize(winnerIndices, winnerCount + 1);
+         ArrayResize(winnerProfits, winnerCount + 1);
+         winnerIndices[winnerCount] = i;
+         winnerProfits[winnerCount] = profits[i];
+         winnerCount++;
+      }
+      else if(profits[i] < 0)
       {
          ArrayResize(loserIndices, loserCount + 1);
          ArrayResize(loserProfits, loserCount + 1);
@@ -364,100 +385,115 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
       }
    }
 
+   // No losers: check if total profit justifies closing all
    if(loserCount == 0)
    {
-      // All positions are in profit - check if we should close all with TP
-      if(InpTakeProfitPips > 0)
-      {
-         double totalProfit = 0;
-         for(int i = 0; i < count; i++)
-            totalProfit += profits[i];
+      double totalProfit = 0;
+      for(int i = 0; i < count; i++)
+         totalProfit += profits[i];
 
-         double tpValue = InpTakeProfitPips * PointsToPips() * lots[0] *
-                          SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-         if(totalProfit >= tpValue)
-            CloseAllPositions(direction);
+      // Close all if combined profit > surplus threshold
+      double minClose = InpSurplusPercent * InpBaseLotSize *
+                        SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      if(totalProfit > minClose)
+      {
+         CloseAllPositions(direction);
+         Print("ALL IN PROFIT: Closed all ", count, " positions. Total: +",
+               DoubleToString(totalProfit, 2));
       }
       return;
    }
 
-   // Sort losers by loss (smallest absolute loss first = easiest to cover)
+   // No winners yet: nothing to recover with
+   if(winnerCount == 0)
+      return;
+
+   // === RECOVERY: Pool ALL winning profit together ===
+   double totalWinProfit = 0;
+   for(int i = 0; i < winnerCount; i++)
+      totalWinProfit += winnerProfits[i];
+
+   // Sort losers by smallest loss first
    SortLosersByLoss(loserIndices, loserProfits, loserCount);
 
-   // Surplus multiplier: e.g. 10% means we need loss * 1.10 of profit to close
    double surplusMultiplier = 1.0 + (InpSurplusPercent / 100.0);
 
    if(InpPartialRecovery)
    {
-      // Progressive recovery: close losers one by one, each with guaranteed surplus
-      double availableProfit = recoveryProfit;
-      int closedCount = 0;
+      // Progressive: use combined winner profit to close losers one by one
+      double availableProfit = totalWinProfit;
+      int closedLosers = 0;
       double totalSurplusEarned = 0;
 
       for(int i = 0; i < loserCount; i++)
       {
          double absLoss = MathAbs(loserProfits[i]);
-         // Required profit = loss + surplus%. E.g. loss=100$, surplus=10% => need 110$
          double requiredProfit = absLoss * surplusMultiplier;
 
          if(availableProfit >= requiredProfit)
          {
-            // Close the losing position - surplus guaranteed
             int idx = loserIndices[i];
-            double surplus = requiredProfit - absLoss;  // Our net gain on this closure
+            double surplus = requiredProfit - absLoss;
 
             trade.PositionClose(tickets[idx]);
-            closedCount++;
+            closedLosers++;
             totalSurplusEarned += surplus;
             availableProfit -= requiredProfit;
 
-            Print("RECOVERY: Closed #", tickets[idx],
+            Print("RECOVERY: Closed loser #", tickets[idx],
                   " | Loss: ", DoubleToString(loserProfits[i], 2),
-                  " | Required: ", DoubleToString(requiredProfit, 2),
-                  " | Surplus earned: +", DoubleToString(surplus, 2),
-                  " | Remaining profit: ", DoubleToString(availableProfit, 2));
+                  " | Surplus: +", DoubleToString(surplus, 2),
+                  " | Pool remaining: ", DoubleToString(availableProfit, 2));
          }
          else
          {
-            // Not enough profit yet for this loser - stop, wait for more profit
             break;
          }
       }
 
-      // If we closed all losers, close recovery trade too to lock remaining profit
-      if(closedCount > 0 && closedCount == loserCount)
+      // If ALL losers closed, close ALL winners too to lock profit
+      if(closedLosers > 0 && closedLosers == loserCount)
       {
-         trade.PositionClose(tickets[newestIdx]);
-         Print("RECOVERY COMPLETE: All ", closedCount, " losers closed.",
-               " Total surplus: +", DoubleToString(totalSurplusEarned, 2),
-               " Remaining locked: +", DoubleToString(availableProfit, 2));
+         for(int i = 0; i < winnerCount; i++)
+            trade.PositionClose(tickets[winnerIndices[i]]);
+
+         Print("RECOVERY COMPLETE: ", closedLosers, " losers + ", winnerCount, " winners closed.",
+               " Surplus: +", DoubleToString(totalSurplusEarned, 2),
+               " Locked: +", DoubleToString(availableProfit, 2));
       }
-      // If we closed some but not all, close recovery trade to lock partial gains
-      else if(closedCount > 0 && availableProfit < (MathAbs(loserProfits[loserIndices[closedCount]]) * surplusMultiplier * 0.5))
+      // Closed some losers but not all: close winners to lock partial recovery
+      else if(closedLosers > 0)
       {
-         // Not enough left to cover next loser even at 50% - lock what we have
-         trade.PositionClose(tickets[newestIdx]);
-         Print("RECOVERY PARTIAL: Closed ", closedCount, "/", loserCount, " losers.",
-               " Surplus earned: +", DoubleToString(totalSurplusEarned, 2),
-               " Profit locked: +", DoubleToString(availableProfit, 2));
+         // Check if remaining profit is too small to cover next loser
+         int nextLoserArrayIdx = closedLosers; // index in loserIndices
+         double nextLossNeeded = MathAbs(loserProfits[nextLoserArrayIdx]) * surplusMultiplier;
+
+         if(availableProfit < nextLossNeeded * 0.3)
+         {
+            // Not enough to cover next loser: close all winners, lock gains
+            for(int i = 0; i < winnerCount; i++)
+               trade.PositionClose(tickets[winnerIndices[i]]);
+
+            Print("RECOVERY PARTIAL: ", closedLosers, "/", loserCount, " losers closed.",
+                  " Surplus: +", DoubleToString(totalSurplusEarned, 2),
+                  " Winners closed to lock profit.");
+         }
+         // Otherwise keep winners open to grow more profit
       }
-      // Otherwise keep recovery trade open - it's still growing
    }
    else
    {
-      // Batch recovery: close ALL only when profit covers ALL losses + surplus on each
+      // Batch: close ALL only when total winner profit covers ALL losses + surplus
       double totalRequired = 0;
       for(int i = 0; i < loserCount; i++)
          totalRequired += MathAbs(loserProfits[i]) * surplusMultiplier;
 
-      if(recoveryProfit >= totalRequired)
+      if(totalWinProfit >= totalRequired)
       {
-         double totalSurplus = recoveryProfit - totalRequired + (totalRequired - totalRequired / surplusMultiplier);
          CloseAllPositions(direction);
-         Print("RECOVERY BATCH: All positions closed.",
-               " Recovery profit: ", DoubleToString(recoveryProfit, 2),
-               " Required (with surplus): ", DoubleToString(totalRequired, 2),
-               " Net surplus: +", DoubleToString(recoveryProfit - totalRequired / surplusMultiplier * (surplusMultiplier - 1.0), 2));
+         Print("RECOVERY BATCH: All closed. Winners: +", DoubleToString(totalWinProfit, 2),
+               " | Required: ", DoubleToString(totalRequired, 2),
+               " | Net surplus: +", DoubleToString(totalWinProfit - totalRequired, 2));
       }
    }
 }
