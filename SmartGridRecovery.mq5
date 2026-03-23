@@ -44,12 +44,13 @@ CPositionInfo  posInfo;
 
 double         gridSpacingPoints;    // Grid spacing in points (fixed at grid start)
 double         pointValue;           // Point value
-int            symDigits;               // Symbol symDigits
+int            symDigits;            // Symbol digits
 int            atrHandle;            // ATR indicator handle
 int            emaHandle;            // EMA indicator handle
 datetime       lastBarTime;          // Track new bar
 double         lastGridPriceBuy;     // Price of last BUY grid order
 double         lastGridPriceSell;    // Price of last SELL grid order
+datetime       lastRecoveryTime;     // Cooldown: when last recovery cycle ended
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -109,6 +110,7 @@ int OnInit()
    lastGridPriceBuy = 0;
    lastGridPriceSell = 0;
    gridSpacingPoints = 0;
+   lastRecoveryTime = 0;
 
    Print("SmartGrid Recovery EA initialized. Risk Level: ", InpRiskLevel);
 
@@ -210,9 +212,13 @@ void ManageGridSide(ENUM_ORDER_TYPE direction, int currentCount)
    if(InpUseTrendFilter && !CheckTrendFilter(direction))
       return;
 
-   // No positions yet: open first
+   // No positions yet: open first (with cooldown after recovery)
    if(currentCount == 0)
    {
+      // Cooldown: wait at least 4 hours after last recovery before new grid
+      if(lastRecoveryTime > 0 && (TimeCurrent() - lastRecoveryTime) < 4 * 3600)
+         return;
+
       // Reset grid tracking for new cycle
       if(direction == ORDER_TYPE_BUY)
          lastGridPriceBuy = 0;
@@ -327,19 +333,24 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
    if(count == 0)
       return;
 
-   // === SINGLE POSITION: close it if in profit (no TP needed, just close) ===
+   // Calculate TP threshold in money (for closing logic)
+   double tpMoney = InpTakeProfitPips * PointsToPips() * InpBaseLotSize *
+                    SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+   // === SINGLE POSITION: close only when it reaches TP target ===
    if(count == 1)
    {
-      if(profits[0] > 0)
+      if(profits[0] >= tpMoney && tpMoney > 0)
       {
          trade.PositionClose(tickets[0]);
-         Print("SINGLE POSITION #", tickets[0], " closed in profit: +",
+         lastRecoveryTime = TimeCurrent();
+         Print("SINGLE POSITION #", tickets[0], " hit TP target, closed: +",
                DoubleToString(profits[0], 2));
       }
       return;
    }
 
-   // === CHECK: are ALL positions in profit? Close everything ===
+   // === CHECK: are ALL positions in profit with meaningful total? ===
    double totalProfit = 0;
    bool allPositive = true;
    for(int i = 0; i < count; i++)
@@ -349,9 +360,10 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
          allPositive = false;
    }
 
-   if(allPositive && totalProfit > 0)
+   if(allPositive && totalProfit >= tpMoney)
    {
       CloseAllPositions(direction);
+      lastRecoveryTime = TimeCurrent();
       Print("ALL IN PROFIT: Closed ", count, " positions. Total: +",
             DoubleToString(totalProfit, 2));
       return;
@@ -383,6 +395,8 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
       // Close FIRST (loser) and LAST (winner) together
       trade.PositionClose(tickets[firstIdx]);
       trade.PositionClose(tickets[lastIdx]);
+
+      lastRecoveryTime = TimeCurrent();
 
       Print("RECOVERY: LAST #", tickets[lastIdx], " (+", DoubleToString(lastProfit, 2), ")",
             " closed FIRST #", tickets[firstIdx], " (", DoubleToString(firstProfit, 2), ")",
