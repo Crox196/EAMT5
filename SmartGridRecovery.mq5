@@ -324,8 +324,38 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
       openTimes[idx]  = posInfo.Time();
    }
 
-   if(count < 2)
+   if(count == 0)
       return;
+
+   // === SINGLE POSITION: close it if in profit (no TP needed, just close) ===
+   if(count == 1)
+   {
+      if(profits[0] > 0)
+      {
+         trade.PositionClose(tickets[0]);
+         Print("SINGLE POSITION #", tickets[0], " closed in profit: +",
+               DoubleToString(profits[0], 2));
+      }
+      return;
+   }
+
+   // === CHECK: are ALL positions in profit? Close everything ===
+   double totalProfit = 0;
+   bool allPositive = true;
+   for(int i = 0; i < count; i++)
+   {
+      totalProfit += profits[i];
+      if(profits[i] < 0)
+         allPositive = false;
+   }
+
+   if(allPositive && totalProfit > 0)
+   {
+      CloseAllPositions(direction);
+      Print("ALL IN PROFIT: Closed ", count, " positions. Total: +",
+            DoubleToString(totalProfit, 2));
+      return;
+   }
 
    // Sort by open time: index 0 = FIRST (oldest), index count-1 = LAST (newest)
    SortByOpenTime(tickets, profits, openPrices, lots, openTimes, count);
@@ -337,25 +367,9 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
    double firstProfit = profits[firstIdx];   // Should be negative (loss)
    double lastProfit  = profits[lastIdx];    // Should be positive (gain)
 
-   // Last must be in profit
-   if(lastProfit <= 0)
+   // Last must be in profit, first must be in loss
+   if(lastProfit <= 0 || firstProfit >= 0)
       return;
-
-   // First must be in loss
-   if(firstProfit >= 0)
-   {
-      // All positions profitable - close everything
-      double totalProfit = 0;
-      for(int i = 0; i < count; i++)
-         totalProfit += profits[i];
-      if(totalProfit > 0)
-      {
-         CloseAllPositions(direction);
-         Print("ALL IN PROFIT: Closed ", count, " positions. Total: +",
-               DoubleToString(totalProfit, 2));
-      }
-      return;
-   }
 
    // Check: can LAST's profit cover FIRST's loss + surplus?
    double absLoss = MathAbs(firstProfit);
@@ -370,12 +384,10 @@ void RecoveryCheck(ENUM_ORDER_TYPE direction)
       trade.PositionClose(tickets[firstIdx]);
       trade.PositionClose(tickets[lastIdx]);
 
-      Print("RECOVERY: LAST #", tickets[lastIdx], " (+" , DoubleToString(lastProfit, 2), ")",
+      Print("RECOVERY: LAST #", tickets[lastIdx], " (+", DoubleToString(lastProfit, 2), ")",
             " closed FIRST #", tickets[firstIdx], " (", DoubleToString(firstProfit, 2), ")",
             " | Net surplus: +", DoubleToString(surplus, 2),
             " | Remaining positions: ", count - 2);
-
-      // After closing this pair, the next tick will check the new first/last pair
    }
 }
 
