@@ -43,13 +43,14 @@ input string   InpComment          = "SGR";   // Order comment
 CTrade         trade;
 CPositionInfo  posInfo;
 
-double         gridSpacingPoints;    // Grid spacing in points
+double         gridSpacingPoints;    // Grid spacing in points (fixed at grid start)
 double         pointValue;           // Point value
 int            digits;               // Symbol digits
 int            atrHandle;            // ATR indicator handle
 int            emaHandle;            // EMA indicator handle
 datetime       lastBarTime;          // Track new bar
-double         lastGridPrice;        // Price of last grid order
+double         lastGridPriceBuy;     // Price of last BUY grid order
+double         lastGridPriceSell;    // Price of last SELL grid order
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -98,7 +99,8 @@ int OnInit()
    }
 
    lastBarTime = 0;
-   lastGridPrice = 0;
+   lastGridPriceBuy = 0;
+   lastGridPriceSell = 0;
    gridSpacingPoints = 0;
 
    Print("SmartGrid Recovery EA initialized. Risk Level: ", InpRiskLevel);
@@ -159,6 +161,11 @@ void OnTick()
 //+------------------------------------------------------------------+
 void UpdateGridSpacing()
 {
+   // Only calculate once when grid starts (spacing = 0 means no grid active)
+   // Recalculate only when no positions are open (new grid cycle)
+   if(gridSpacingPoints > 0)
+      return;
+
    double atrBuffer[];
    ArraySetAsSeries(atrBuffer, true);
 
@@ -168,15 +175,19 @@ void UpdateGridSpacing()
    double dailyATR = atrBuffer[0];
 
    // Risk level divisor: 1=1x, 2=2x, 3=3x, 4=4x, 5=5x
-   // Level 1 (conservative): grid = full daily ATR (~95 pips EURUSD)
-   // Level 5 (aggressive): grid = ATR/5 (~19 pips EURUSD)
    double divisor = (double)InpRiskLevel;
    gridSpacingPoints = dailyATR / divisor;
 
-   // Minimum spacing safety: at least 10 pips for major pairs
-   double minSpacing = 10.0 * pointValue * (digits == 3 || digits == 5 ? 10 : 1);
+   // Minimum spacing: 10 pips for 5-digit brokers
+   double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+   double minSpacing = 10.0 * pointValue * pipMultiplier;
    if(gridSpacingPoints < minSpacing)
       gridSpacingPoints = minSpacing;
+
+   double spacingPips = gridSpacingPoints / (pointValue * pipMultiplier);
+   Print("Grid spacing FIXED at: ", DoubleToString(spacingPips, 1),
+         " pips (ATR=", DoubleToString(dailyATR / (pointValue * pipMultiplier), 1),
+         " pips, Risk=", InpRiskLevel, ")");
 }
 
 //+------------------------------------------------------------------+
@@ -195,8 +206,22 @@ void ManageGridSide(ENUM_ORDER_TYPE direction, int currentCount)
    // No positions yet: open first
    if(currentCount == 0)
    {
+      // Reset grid tracking for new cycle
+      if(direction == ORDER_TYPE_BUY)
+         lastGridPriceBuy = 0;
+      else
+         lastGridPriceSell = 0;
+      gridSpacingPoints = 0; // Force recalculate ATR for new grid cycle
+      UpdateGridSpacing();
+
       double lot = InpBaseLotSize;
-      OpenPosition(direction, lot, "L1");
+      if(OpenPosition(direction, lot, "L1"))
+      {
+         if(direction == ORDER_TYPE_BUY)
+            lastGridPriceBuy = ask;
+         else
+            lastGridPriceSell = bid;
+      }
       return;
    }
 
@@ -204,21 +229,19 @@ void ManageGridSide(ENUM_ORDER_TYPE direction, int currentCount)
    if(currentCount >= InpMaxGridLevels)
       return;
 
-   // Find the worst (furthest in loss) position on this side
-   double worstPrice = 0;
-   GetWorstPositionPrice(direction, worstPrice);
-
-   if(worstPrice <= 0)
+   // Get price of the LAST opened position on this side
+   double lastPrice = GetLastOpenedPrice(direction);
+   if(lastPrice <= 0)
       return;
 
-   // Calculate distance from worst position to current price
+   // Calculate distance from LAST position to current price (must be against us)
    double distance = 0;
    if(direction == ORDER_TYPE_BUY)
-      distance = worstPrice - currentPrice;  // BUY: loss when price drops
+      distance = lastPrice - currentPrice;   // BUY grid: price dropped from last entry
    else
-      distance = currentPrice - worstPrice;  // SELL: loss when price rises
+      distance = currentPrice - lastPrice;   // SELL grid: price rose from last entry
 
-   // If price moved against us by gridSpacing, open new level
+   // Only open new level if price moved EXACTLY gridSpacing away from last position
    if(distance >= gridSpacingPoints)
    {
       // Calculate lot with multiplier
@@ -226,12 +249,22 @@ void ManageGridSide(ENUM_ORDER_TYPE direction, int currentCount)
       lot = NormalizeLot(lot);
 
       string levelComment = "L" + IntegerToString(currentCount + 1);
-      OpenPosition(direction, lot, levelComment);
+      double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0;
 
-      Print("Grid level ", currentCount + 1, " opened. Direction: ",
-            (direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
-            " Lot: ", DoubleToString(lot, 2),
-            " Spacing: ", DoubleToString(gridSpacingPoints / pointValue, 1), " points");
+      if(OpenPosition(direction, lot, levelComment))
+      {
+         // Update last grid price to THIS position
+         if(direction == ORDER_TYPE_BUY)
+            lastGridPriceBuy = ask;
+         else
+            lastGridPriceSell = bid;
+
+         Print("Grid level ", currentCount + 1, " | ",
+               (direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+               " | Lot: ", DoubleToString(lot, 2),
+               " | Distance from prev: ", DoubleToString(distance / (pointValue * pipMultiplier), 1), " pips",
+               " | Grid spacing: ", DoubleToString(gridSpacingPoints / (pointValue * pipMultiplier), 1), " pips");
+      }
    }
 }
 
@@ -482,12 +515,12 @@ void CountPositions(int &buyCount, int &sellCount, double &buyProfit, double &se
 }
 
 //+------------------------------------------------------------------+
-//| Get worst position price (furthest in loss)                       |
+//| Get price of the LAST (most recent) opened position               |
 //+------------------------------------------------------------------+
-void GetWorstPositionPrice(ENUM_ORDER_TYPE direction, double &worstPrice)
+double GetLastOpenedPrice(ENUM_ORDER_TYPE direction)
 {
-   worstPrice = 0;
-   double worstProfit = DBL_MAX;
+   double lastPrice = 0;
+   datetime lastTime = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -503,13 +536,14 @@ void GetWorstPositionPrice(ENUM_ORDER_TYPE direction, double &worstPrice)
          (direction == ORDER_TYPE_SELL && posType != POSITION_TYPE_SELL))
          continue;
 
-      double profit = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
-      if(profit < worstProfit)
+      if(posInfo.Time() > lastTime)
       {
-         worstProfit = profit;
-         worstPrice = posInfo.PriceOpen();
+         lastTime = posInfo.Time();
+         lastPrice = posInfo.PriceOpen();
       }
    }
+
+   return lastPrice;
 }
 
 //+------------------------------------------------------------------+
@@ -541,7 +575,6 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, double lot, string levelTag)
 
    if(result)
    {
-      lastGridPrice = (direction == ORDER_TYPE_BUY) ? ask : bid;
       Print("Position opened: ", (direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
             " Lot: ", DoubleToString(lot, 2), " Level: ", levelTag,
             (tp > 0 ? " TP: " + DoubleToString(tp, digits) : ""));
