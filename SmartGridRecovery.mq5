@@ -34,7 +34,7 @@ input bool     InpBothDirections   = false;   // Trade both directions (hedge)
 
 input group "=== Risk Management ==="
 input double   InpMaxDrawdownPct   = 15.0;    // Max drawdown % to stop trading
-input double   InpTakeProfitPips   = 0.0;     // TP for single position (0=disabled)
+input double   InpTakeProfitPips   = 50.0;    // TP pips for initial position (0=disabled)
 input int      InpMagicNumber      = 777777;  // Magic number
 input string   InpComment          = "SGR";   // Order comment
 
@@ -516,17 +516,29 @@ bool OpenPosition(ENUM_ORDER_TYPE direction, double lot, string levelTag)
 
    string comment = InpComment + "_" + levelTag;
 
+   // TP only on the initial position (L1) - grid levels use recovery system
+   double tp = 0;
+   if(levelTag == "L1" && InpTakeProfitPips > 0)
+   {
+      double tpDistance = InpTakeProfitPips * PointsToPips();
+      if(direction == ORDER_TYPE_BUY)
+         tp = NormalizeDouble(ask + tpDistance, digits);
+      else
+         tp = NormalizeDouble(bid - tpDistance, digits);
+   }
+
    bool result = false;
    if(direction == ORDER_TYPE_BUY)
-      result = trade.Buy(lot, _Symbol, ask, 0, 0, comment);
+      result = trade.Buy(lot, _Symbol, ask, 0, tp, comment);
    else
-      result = trade.Sell(lot, _Symbol, bid, 0, 0, comment);
+      result = trade.Sell(lot, _Symbol, bid, 0, tp, comment);
 
    if(result)
    {
       lastGridPrice = (direction == ORDER_TYPE_BUY) ? ask : bid;
       Print("Position opened: ", (direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
-            " Lot: ", DoubleToString(lot, 2), " Level: ", levelTag);
+            " Lot: ", DoubleToString(lot, 2), " Level: ", levelTag,
+            (tp > 0 ? " TP: " + DoubleToString(tp, digits) : ""));
    }
    else
    {
